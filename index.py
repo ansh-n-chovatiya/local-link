@@ -2,21 +2,30 @@
 """
 local-link — Link/unlink local packages for live development.
 
-Run from the consuming app root (e.g. concierge-ui/).
+Run from the consuming app root (the Vite app you're developing against).
 
 Commands:
-  link    Link a local package source into this app
-  unlink  Restore a package to its published version
+  link    Link one or more local package sources into this app
+  unlink  Restore package(s) to their published version
   list    Show all currently active local links
   find    Locate the source directory for a package without linking
+  repair  Re-apply Vite patches to existing links (use after a tool upgrade)
 
 Examples:
-  python3 ../local-link/index.py link -p @RHCommerceDev/new-pdp -s ../estore-ui/src/pages/NewPDP
-  python3 ../local-link/index.py link -p @RHCommerceDev/new-pdp          # auto-detect source
-  python3 ../local-link/index.py unlink -p @RHCommerceDev/new-pdp
-  python3 ../local-link/index.py list
-  python3 ../local-link/index.py find -p @RHCommerceDev/new-pdp
+  vite-local-link link -p my-package                        # auto-detect source
+  vite-local-link link -p my-package=../my-package-repo/src # explicit source
+  vite-local-link link -p pkg-a pkg-b pkg-c                  # link several at once
+  vite-local-link unlink -p my-package
+  vite-local-link unlink --all                               # unlink everything, revert vite.config
+  vite-local-link list
+  vite-local-link find -p my-package
 """
+
+# Defers evaluation of type annotations (PEP 563) so the `X | None` /
+# `dict[str, str]` hints below (PEP 604 / 585, Python 3.10 / 3.9+ syntax)
+# don't raise TypeError on import under older interpreters — they're only
+# ever used as annotations here, never evaluated at runtime.
+from __future__ import annotations
 
 import argparse
 import json
@@ -27,9 +36,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-STATE_FILE = ".local-links.json"
+STATE_FILE = "local-link/state.json"
 PACKAGE_JSON = "package.json"
-VITE_SIDECAR = ".local-link-vite.json"
+VITE_SIDECAR = "local-link/vite-aliases.json"
+
+# Pre-1.1 file locations. Read for one-time migration only; never written.
+LEGACY_STATE_FILE = ".local-links.json"
+LEGACY_VITE_SIDECAR = ".local-link-vite.json"
 
 # Candidate names for the Vite config file (checked in order).
 VITE_CONFIG_NAMES = [
@@ -47,31 +60,139 @@ DEDUPE_PACKAGES = [
     "react-router-dom",
 ]
 
+LOCK_FILE = "local-link/.lock"
 
-# Sibling directories to search when auto-detecting source paths.
-# These are resolved relative to the consuming app root at runtime.
-DEFAULT_SEARCH_ROOTS = [
-    "../estore-ui",
-    "../concierge-ui",
-    "../shop-ui-develop",
-    "../shared-ui",
-    "..",  # catch-all: any immediate sibling repo
-]
+
+def _get_version() -> str:
+    """Read the version from package.json — the one place it's declared."""
+    try:
+        pkg_path = Path(__file__).resolve().parent / "package.json"
+        return json.loads(pkg_path.read_text()).get("version", "unknown")
+    except (OSError, json.JSONDecodeError):
+        return "unknown"
+
+
+__version__ = _get_version()
 
 
 # ── State ──────────────────────────────────────────────────────────────────
+
+def _ensure_local_link_dir() -> Path:
+    """
+    Create the local-link/ folder and give it a catch-all .gitignore, so
+    nothing inside it is ever git-tracked and nobody has to touch the
+    project's own .gitignore.
+    """
+    d = Path(STATE_FILE).parent
+    d.mkdir(parents=True, exist_ok=True)
+    gitignore = d / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("*\n")
+    return d
+
+
+def _remove_legacy_gitignore_entries() -> None:
+    """
+    Pre-1.1 versions appended their state/sidecar filenames straight into the
+    project's own .gitignore. Strip those two lines if a legacy install is
+    actually detected, so upgrading fully honors "never touch the project
+    .gitignore" too. Only runs when there's evidence of a legacy install —
+    never rewrites a project .gitignore that has nothing to do with this tool.
+    """
+    if not (Path(LEGACY_STATE_FILE).exists() or Path(LEGACY_VITE_SIDECAR).exists()):
+        return
+    gitignore = Path(".gitignore")
+    if not gitignore.exists():
+        return
+    lines = gitignore.read_text().splitlines()
+    kept = [l for l in lines if l not in (LEGACY_STATE_FILE, LEGACY_VITE_SIDECAR)]
+    if kept != lines:
+        text = "\n".join(kept)
+        gitignore.write_text((text + "\n") if text else "")
+
 
 def load_state() -> dict:
     if Path(STATE_FILE).exists():
         with open(STATE_FILE) as f:
             return json.load(f)
+    if Path(LEGACY_STATE_FILE).exists():
+        with open(LEGACY_STATE_FILE) as f:
+            return json.load(f)
     return {}
 
 
 def save_state(state: dict) -> None:
+    _remove_legacy_gitignore_entries()  # while legacy files still prove there was one
+    _ensure_local_link_dir()
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
         f.write("\n")
+    legacy = Path(LEGACY_STATE_FILE)
+    if legacy.exists():
+        legacy.unlink()
+
+
+def remove_local_link_dir() -> None:
+    """Delete the whole local-link/ folder — used once no links remain."""
+    _remove_legacy_gitignore_entries()  # while legacy files still prove there was one
+    d = Path(STATE_FILE).parent
+    if d.exists():
+        shutil.rmtree(d)
+    for legacy in (LEGACY_STATE_FILE, LEGACY_VITE_SIDECAR):
+        p = Path(legacy)
+        if p.exists():
+            p.unlink()
+
+
+def _acquire_lock() -> Path:
+    """
+    Atomic create-if-absent via O_EXCL — race-free at the OS level, stdlib
+    only. Used to serialize state-mutating commands.
+    """
+    _ensure_local_link_dir()
+    lock_path = Path(LOCK_FILE)
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+    except FileExistsError:
+        print("Error: another vite-local-link command appears to be running")
+        print(f"(lock file: {lock_path}). If that's stale, delete it and retry.")
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error: could not create lock file {lock_path}: {e}")
+        sys.exit(1)
+    return lock_path
+
+
+def _remove_local_link_dir_if_empty() -> None:
+    """
+    _acquire_lock() creates local-link/ (with its .gitignore) before the
+    command body runs, even on no-op paths that never write real state
+    (unlink --all / repair with nothing active, link where every package
+    failed). Clean it back up so a no-op leaves nothing behind — the whole
+    point of this folder is that nothing survives when there's nothing to
+    track.
+    """
+    d = Path(STATE_FILE).parent
+    if d.exists() and not any(p.name != ".gitignore" for p in d.iterdir()):
+        shutil.rmtree(d)
+
+
+def with_state_lock(fn):
+    """
+    Decorator serializing link/unlink/repair so two concurrent invocations
+    can't interleave writes to local-link/state.json or package.json.
+    """
+    def wrapper(*args, **kwargs):
+        lock_path = _acquire_lock()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            _remove_local_link_dir_if_empty()
+    return wrapper
 
 
 # ── package.json ────────────────────────────────────────────────────────────
@@ -92,9 +213,9 @@ def find_pkg_entries(pkg_data: dict, package_name: str) -> dict:
     Return every package.json entry referencing package_name.
 
     Handles:
-      "@RHCommerceDev/new-pdp": "1.0.63"
-      "new-pdp": "npm:@RHCommerceDev/new-pdp@1.0.63"
-      "new-pdp": "file:..."  (already linked)
+      "@my-scope/my-package": "1.0.63"
+      "my-package": "npm:@my-scope/my-package@1.0.63"
+      "my-package": "file:..."  (already linked)
 
     Returns: { section: { key: original_value } }
     """
@@ -119,41 +240,21 @@ def find_pkg_entries(pkg_data: dict, package_name: str) -> dict:
 
 def find_source(package_name: str, app_dir: Path) -> Path | None:
     """
-    Search sibling directories for a package.json whose 'name' field
-    matches package_name.  Searches DEFAULT_SEARCH_ROOTS first, then
-    walks every immediate sibling of the app_dir as a fallback.
+    Recursively search every sibling directory of app_dir for a
+    package.json whose 'name' field matches package_name.
     """
-    checked: set[Path] = set()
-
-    def scan_root(root: Path) -> Path | None:
-        if not root.exists() or root in checked:
-            return None
-        checked.add(root)
-        for pkg_json in root.rglob("package.json"):
-            if "node_modules" in pkg_json.parts:
-                continue
-            try:
-                data = json.loads(pkg_json.read_text())
-            except (json.JSONDecodeError, OSError):
-                continue
-            if data.get("name") == package_name:
-                return pkg_json.parent
-        return None
-
-    # 1. Check configured search roots
-    for rel in DEFAULT_SEARCH_ROOTS:
-        result = scan_root((app_dir / rel).resolve())
-        if result:
-            return result
-
-    # 2. Fallback: all immediate siblings of the app directory
     parent = app_dir.parent
-    for sibling in sorted(parent.iterdir()):
-        if sibling.is_dir() and sibling != app_dir:
-            result = scan_root(sibling)
-            if result:
-                return result
-
+    if not parent.exists():
+        return None
+    for pkg_json in parent.rglob("package.json"):
+        if "node_modules" in pkg_json.parts:
+            continue
+        try:
+            data = json.loads(pkg_json.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("name") == package_name:
+            return pkg_json.parent
     return None
 
 
@@ -191,7 +292,7 @@ def _src_subpath(value: str) -> str | None:
 def scan_bare_imports(source_path: Path) -> set[str]:
     """
     Scan all .ts/.tsx/.js/.jsx files under source_path for bare module imports.
-    Returns root package names (e.g. 'unstyled-ui-components', 'react').
+    Returns root package names (e.g. 'my-ui-components', 'react').
     Bare = not starting with '.' or '/'.
     """
     bare: set[str] = set()
@@ -231,7 +332,7 @@ def compute_companion_aliases(state: dict, app_dir: Path) -> dict[str, str]:
     app_pkg = load_pkg()
 
     # Build: bare-name → value, for all non-scoped deps in the consuming app
-    # e.g.  "unstyled-ui-components" → "npm:@RHCommerceDev/unstyled-ui-components@1.0.51"
+    # e.g.  "my-ui-components" → "npm:@my-scope/my-ui-components@1.0.51"
     consuming_bare: dict[str, str] = {}
     for section in ("dependencies", "devDependencies"):
         for key, value in app_pkg.get(section, {}).items():
@@ -324,7 +425,7 @@ _IIFE = f"""\
 const __localLinkAliases = (() => {{
   try {{
     const fs = require("fs"), path = require("path");
-    const p = path.resolve(__dirname, ".local-link-vite.json");
+    const p = path.resolve(__dirname, {json.dumps(VITE_SIDECAR)});
     if (!fs.existsSync(p)) return {{}};
     const d = JSON.parse(fs.readFileSync(p, "utf-8"));
     return Object.fromEntries(
@@ -333,25 +434,41 @@ const __localLinkAliases = (() => {{
   }} catch {{ return {{}}; }}
 }})(); {_LL}"""
 
-# ESM variant (for .ts / .mts / .mjs configs that use import.meta)
+# ESM variant (for .ts / .mts / .mjs configs that use import.meta).
+# Namespaced import names avoid colliding with the host config's own
+# `import path from "path"` / `import fs from "fs"` — extremely common in
+# vite.config.ts files that build resolve.alias entries by hand.
 _IIFE_ESM = f"""\
 {_LL}
-import fs from "fs"; {_LL}
+import * as __localLinkFs from "node:fs"; {_LL}
+import * as __localLinkPath from "node:path"; {_LL}
+import {{ fileURLToPath as __localLinkFileURLToPath }} from "node:url"; {_LL}
 const __localLinkAliases = (() => {{
   try {{
-    const p = new URL(".local-link-vite.json", import.meta.url).pathname;
-    if (!fs.existsSync(p)) return {{}};
-    const d = JSON.parse(fs.readFileSync(p, "utf-8"));
-    const dir = new URL(".", import.meta.url).pathname;
+    const __localLinkDir = __localLinkPath.dirname(__localLinkFileURLToPath(import.meta.url));
+    const p = __localLinkPath.join(__localLinkDir, {json.dumps(VITE_SIDECAR)});
+    if (!__localLinkFs.existsSync(p)) return {{}};
+    const d = JSON.parse(__localLinkFs.readFileSync(p, "utf-8"));
     return Object.fromEntries(
-      Object.entries(d.aliases ?? {{}}).map(([k, v]) => [k, path.join(dir, v)])
+      Object.entries(d.aliases ?? {{}}).map(([k, v]) => [k, __localLinkPath.join(__localLinkDir, v)])
     );
   }} catch {{ return {{}}; }}
 }})(); {_LL}"""
 
 
 def _is_esm_config(config_path: Path) -> bool:
-    return config_path.suffix in (".ts", ".mts", ".mjs")
+    """
+    .mjs/.mts are unambiguously ESM. .ts/.js depend on the nearest
+    package.json's "type" field — Vite bundles them as CJS unless it's
+    "module", so blindly treating .ts as ESM breaks configs without it.
+    """
+    if config_path.suffix in (".mjs", ".mts"):
+        return True
+    try:
+        pkg_type = json.loads((config_path.parent / PACKAGE_JSON).read_text()).get("type")
+    except (OSError, json.JSONDecodeError):
+        pkg_type = None
+    return pkg_type == "module"
 
 
 def patch_vite_config(config_path: Path) -> str:
@@ -363,8 +480,8 @@ def patch_vite_config(config_path: Path) -> str:
     original = content
     esm = _is_esm_config(config_path)
 
-    # Guard: already patched
-    if "__localLinkAliases" in content:
+    # Guard: already patched with the current sidecar path.
+    if json.dumps(VITE_SIDECAR) in content:
         return original
 
     iife = _IIFE_ESM if esm else _IIFE
@@ -381,11 +498,14 @@ def patch_vite_config(config_path: Path) -> str:
     # 2. Add dedupe to the resolve block.
     #    Pattern: the `resolve:` key inside the config object.
     #    We match `resolve: {` or `resolve:{` and insert dedupe as first key.
+    # A trailing "\n" guards against a same-line closing brace (e.g. `resolve: {}`,
+    # a common Vite scaffold default) — without it, the `}` would land on the
+    # `// @local-link` comment line and get swallowed, breaking the config.
     dedupe_line = f"      dedupe: {json.dumps(DEDUPE_PACKAGES)}, {_LL}"
     if "dedupe:" not in content:
         content = re.sub(
             r"(\bresolve\s*:\s*\{)",
-            f"\\1\n{dedupe_line}",
+            f"\\1\n{dedupe_line}\n",
             content,
             count=1,
         )
@@ -396,7 +516,7 @@ def patch_vite_config(config_path: Path) -> str:
     if "...__localLinkAliases" not in content:
         content = re.sub(
             r"(\balias\s*:\s*\{)",
-            f"\\1\n{aliases_line}",
+            f"\\1\n{aliases_line}\n",
             content,
             count=1,
         )
@@ -410,31 +530,49 @@ def revert_vite_config(config_path: Path, original_content: str) -> None:
     config_path.write_text(original_content)
 
 
+def ensure_vite_patch_current(app_dir: Path, state: dict) -> Path | None:
+    """
+    Make sure vite.config carries a patch pointing at the current sidecar
+    path. No-ops if a current patch is already present. Migrates (revert +
+    re-patch) a stale patch left by an older version of this tool. Applies
+    a fresh patch if there is none yet. Returns the vite.config path, or
+    None if the app has no vite.config.
+    """
+    vite_cfg = find_vite_config(app_dir)
+    if not vite_cfg:
+        return None
+
+    content = vite_cfg.read_text()
+    if json.dumps(VITE_SIDECAR) in content:
+        return vite_cfg  # already current
+
+    if "__localLinkAliases" in content:
+        vite_meta = state.get("__vite_config")
+        if not vite_meta or Path(vite_meta["path"]) != vite_cfg:
+            print(f"\nError: {vite_cfg.name} has a local-link patch from an older")
+            print("version, and its original content wasn't recorded, so it can't be")
+            print("migrated automatically. Restore it manually (e.g. from git), then")
+            print("re-run this command — proceeding would leave the alias sidecar")
+            print("pointing at a config that never reads it.")
+            sys.exit(1)
+        print(f"\nMigrating local-link patch in {vite_cfg.name}...")
+        revert_vite_config(vite_cfg, vite_meta["original"])
+
+    print(f"Patching {vite_cfg.name} for local-link mode...")
+    original = patch_vite_config(vite_cfg)
+    state["__vite_config"] = {"path": str(vite_cfg), "original": original}
+    print(f"  ✓ dedupe + alias sidecar enabled in {vite_cfg.name}")
+    return vite_cfg
+
+
 def write_vite_sidecar(aliases: dict[str, str]) -> None:
+    _ensure_local_link_dir()
     with open(VITE_SIDECAR, "w") as f:
         json.dump({"aliases": aliases}, f, indent=2)
         f.write("\n")
-
-
-def remove_vite_sidecar() -> None:
-    p = Path(VITE_SIDECAR)
-    if p.exists():
-        p.unlink()
-
-
-# ── .gitignore ──────────────────────────────────────────────────────────────
-
-def ensure_gitignored(app_dir: Path) -> None:
-    """Add local-link runtime files to .gitignore if not already present."""
-    entries = [STATE_FILE, VITE_SIDECAR]
-    gitignore = app_dir / ".gitignore"
-    existing = gitignore.read_text() if gitignore.exists() else ""
-    additions = [e for e in entries if e not in existing]
-    if additions:
-        sep = "\n" if existing and not existing.endswith("\n") else ""
-        with open(gitignore, "a") as f:
-            f.write(sep + "\n".join(additions) + "\n")
-        print(f"  Added to .gitignore: {', '.join(additions)}")
+    legacy = Path(LEGACY_VITE_SIDECAR)
+    if legacy.exists():
+        legacy.unlink()
 
 
 # ── Vite cache ──────────────────────────────────────────────────────────────
@@ -461,132 +599,177 @@ def run(cmd: str, cwd: str | None = None) -> None:
         sys.exit(1)
 
 
+def install_cmd(app_dir: Path) -> str:
+    """Match whichever package manager's lockfile is already present."""
+    if (app_dir / "pnpm-lock.yaml").exists():
+        return "pnpm install"
+    if (app_dir / "yarn.lock").exists():
+        return "yarn install"
+    return "npm install"
+
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
+def parse_package_spec(spec: str) -> tuple[str, str | None]:
+    """Split 'name' or 'name=source' into (name, source_or_None)."""
+    if "=" in spec:
+        name, source = spec.split("=", 1)
+        return name, source
+    return spec, None
+
+
+@with_state_lock
 def cmd_link(args) -> None:
-    package = args.package
     app_dir = Path.cwd()
+    specs = [parse_package_spec(s) for s in args.package]
 
-    # Resolve source path
-    if args.source:
-        source_path = Path(args.source).resolve()
-    else:
-        print(f"No --source given, searching for '{package}'...")
-        source_path = find_source(package, app_dir)
-        if source_path is None:
-            print(f"\nCould not auto-detect source for '{package}'.")
-            print("Re-run with --source <path>.")
-            sys.exit(1)
-        print(f"Found: {source_path}\n")
-
-    if not source_path.exists():
-        print(f"Error: source path does not exist: {source_path}")
+    if args.source and len(specs) != 1:
+        print("Error: --source only works with a single --package.")
+        print("For multiple packages, give an explicit source per package instead:")
+        print("  vite-local-link link -p name=../path/to/source other-name")
         sys.exit(1)
 
-    src_pkg_json = source_path / "package.json"
-    if not src_pkg_json.exists():
-        print(f"Error: no package.json in {source_path}")
+    if args.source and specs[0][1]:
+        package, inline_source = specs[0]
+        print(f"Error: both --source and an inline source were given for '{package}'")
+        print(f"  (--source {args.source}  vs.  {package}={inline_source})")
+        print("Use only one.")
         sys.exit(1)
-
-    src_name = json.loads(src_pkg_json.read_text()).get("name", "")
-    if src_name != package:
-        print(f"Warning: source package name is '{src_name}', expected '{package}'")
 
     state = load_state()
-    if package in state:
-        print(f"'{package}' is already linked. Run 'unlink' first.")
+    pkg_data = load_pkg()
+    pristine_pkg = load_pkg()  # unmutated snapshot for find_pkg_entries lookups
+
+    linked = []
+    failed = False
+
+    for package, source_arg in specs:
+        if package in state:
+            print(f"'{package}' is already linked. Skipping (run 'unlink' first).")
+            failed = True
+            continue
+
+        source_arg = source_arg or args.source
+        if source_arg:
+            source_path = Path(source_arg).resolve()
+        else:
+            print(f"No source given for '{package}', searching sibling repos...")
+            source_path = find_source(package, app_dir)
+            if source_path is None:
+                print(f"  Could not auto-detect source for '{package}'.")
+                print(f"  Re-run with -p {package}=<path>.")
+                failed = True
+                continue
+            print(f"  Found: {source_path}")
+
+        if not source_path.exists():
+            print(f"Error: source path does not exist: {source_path}")
+            failed = True
+            continue
+
+        src_pkg_json = source_path / "package.json"
+        if not src_pkg_json.exists():
+            print(f"Error: no package.json in {source_path}")
+            failed = True
+            continue
+
+        src_name = json.loads(src_pkg_json.read_text()).get("name", "")
+        if src_name != package:
+            print(f"Warning: source package name is '{src_name}', expected '{package}'")
+
+        entries = find_pkg_entries(pristine_pkg, package)
+        if not entries:
+            print(f"Warning: '{package}' not found in {PACKAGE_JSON}. Continuing anyway.")
+
+        rel_source = os.path.relpath(source_path, app_dir)
+        state[package] = {
+            "source": str(source_path),
+            "rel_source": rel_source,
+            "entries": entries,
+        }
+        for section, keys in entries.items():
+            for key in keys:
+                pkg_data[section][key] = f"file:{rel_source}"
+
+        linked.append((package, source_path, rel_source))
+        print(f"  [{package}]  →  file:{rel_source}")
+
+    if not linked:
+        print("\nNothing linked.")
         sys.exit(1)
 
-    pkg_data = load_pkg()
-    entries = find_pkg_entries(pkg_data, package)
-    if not entries:
-        print(f"Warning: '{package}' not found in {PACKAGE_JSON}. Continuing anyway.")
+    vite_cfg = ensure_vite_patch_current(app_dir, state)
 
-    rel_source = os.path.relpath(source_path, app_dir)
-    is_first_link = len(state) == 0
-
-    state[package] = {
-        "source": str(source_path),
-        "rel_source": rel_source,
-        "entries": entries,
-    }
-
-    # On the first link: patch vite.config and save the original content
-    vite_cfg = find_vite_config(app_dir)
-    if vite_cfg and is_first_link:
-        print(f"\nPatching {vite_cfg.name} for local-link mode...")
-        original = patch_vite_config(vite_cfg)
-        state["__vite_config"] = {
-            "path": str(vite_cfg),
-            "original": original,
-        }
-        print(f"  ✓ dedupe + alias sidecar enabled in {vite_cfg.name}")
-
+    save_pkg(pkg_data)
     save_state(state)
 
-    # Update package.json entries
-    for section, keys in entries.items():
-        for key in keys:
-            pkg_data[section][key] = f"file:{rel_source}"
-    save_pkg(pkg_data)
-
-    print(f"\nUpdated {PACKAGE_JSON}:")
-    for section, keys in entries.items():
-        for key, original in keys.items():
-            print(f"  [{section}] {key}: {original}  →  file:{rel_source}")
-
-    # Recompute companion aliases for all active links
-    active_links = {k: v for k, v in state.items() if not k.startswith("__")}
-    aliases = compute_companion_aliases(active_links, app_dir)
-    if aliases:
+    if vite_cfg:
+        active_links = {k: v for k, v in state.items() if not k.startswith("__")}
+        aliases = compute_companion_aliases(active_links, app_dir)
         write_vite_sidecar(aliases)
-        print(f"\n  Vite aliases applied ({len(aliases)}):")
-        for bare, target in aliases.items():
-            print(f"    {bare}  →  {target}")
-    elif vite_cfg:
-        write_vite_sidecar({})
+        if aliases:
+            print(f"\n  Vite aliases applied ({len(aliases)}):")
+            for bare, target in aliases.items():
+                print(f"    {bare}  →  {target}")
 
-    print("\nRunning npm install...")
-    run("npm install")
+    cmd = install_cmd(app_dir)
+    print(f"\nRunning {cmd}...")
+    run(cmd)
 
     print("\nClearing Vite cache...")
     clear_vite_cache(app_dir)
 
-    ensure_gitignored(app_dir)
+    names = ", ".join(name for name, *_ in linked)
+    print(f"\n✓ Linked {len(linked)} package(s): {names}")
+    for package, source_path, _ in linked:
+        print(f"  {package}  →  {source_path}")
+    print(f"\n  To restore:  vite-local-link unlink -p {names.replace(', ', ' ')}")
 
-    print(f"\n✓ Linked: {package}")
-    print(f"  Source : {source_path}")
-    print(f"  Edit files there and the dev server will pick up changes live.")
-    print(f"\n  To restore:  vite-local-link unlink -p {package}")
-
-
-def cmd_unlink(args) -> None:
-    package = args.package
-    app_dir = Path.cwd()
-    state = load_state()
-
-    if package not in state:
-        print(f"No active link for '{package}'. Nothing to restore.")
+    if failed:
         sys.exit(1)
 
-    entries = state[package]["entries"]
+
+@with_state_lock
+def cmd_unlink(args) -> None:
+    app_dir = Path.cwd()
+    state = load_state()
+    active_before = {k: v for k, v in state.items() if not k.startswith("__")}
+
+    if args.all and not active_before:
+        print("No active links — nothing to unlink.")
+        return
+
+    packages = list(active_before.keys()) if args.all else args.package
 
     pkg_data = load_pkg()
-    print(f"Restoring {PACKAGE_JSON}:")
-    for section, keys in entries.items():
-        for key, original_value in keys.items():
-            if section in pkg_data and key in pkg_data[section]:
-                pkg_data[section][key] = original_value
-                print(f"  [{section}] {key}  →  {original_value}")
-    save_pkg(pkg_data)
+    unlinked = []
 
-    del state[package]
+    for package in packages:
+        if package not in state:
+            print(f"No active link for '{package}'. Skipping.")
+            continue
+
+        print(f"Restoring {PACKAGE_JSON} for '{package}':")
+        entries = state[package]["entries"]
+        for section, keys in entries.items():
+            for key, original_value in keys.items():
+                if section in pkg_data and key in pkg_data[section]:
+                    pkg_data[section][key] = original_value
+                    print(f"  [{section}] {key}  →  {original_value}")
+
+        del state[package]
+        unlinked.append(package)
+
+    if not unlinked:
+        print("\nNothing unlinked.")
+        sys.exit(1)
+
+    save_pkg(pkg_data)
 
     active_links = {k: v for k, v in state.items() if not k.startswith("__")}
     is_last_unlink = len(active_links) == 0
 
     if is_last_unlink:
-        # Revert vite.config to its original state
         vite_meta = state.get("__vite_config")
         if vite_meta:
             vite_path = Path(vite_meta["path"])
@@ -594,25 +777,23 @@ def cmd_unlink(args) -> None:
                 print(f"\nReverting {vite_path.name} to original state...")
                 revert_vite_config(vite_path, vite_meta["original"])
                 print(f"  ✓ {vite_path.name} restored")
-            del state["__vite_config"]
-
-        remove_vite_sidecar()
-        print(f"  Removed {VITE_SIDECAR}")
+        remove_local_link_dir()
+        print("  Removed local-link/ — nothing left to commit.")
     else:
-        # Still some links active — recompute aliases without this package
+        ensure_vite_patch_current(app_dir, state)
         aliases = compute_companion_aliases(active_links, app_dir)
         write_vite_sidecar(aliases)
         print(f"\n  Vite aliases recomputed ({len(aliases)} remaining)")
+        save_state(state)
 
-    save_state(state)
-
-    print("\nRunning npm install...")
-    run("npm install")
+    cmd = install_cmd(app_dir)
+    print(f"\nRunning {cmd}...")
+    run(cmd)
 
     print("\nClearing Vite cache...")
     clear_vite_cache(app_dir)
 
-    print(f"\n✓ Unlinked: {package} restored to published version.")
+    print(f"\n✓ Unlinked {len(unlinked)} package(s): {', '.join(unlinked)}")
     if is_last_unlink:
         print("  No more active links — vite.config reverted to original.")
 
@@ -634,13 +815,14 @@ def cmd_list(args) -> None:
                 print(f"    [{section}] {key} (was: {original})")
         print()
 
+    vite_cfg = find_vite_config(Path.cwd())
     sidecar = Path(VITE_SIDECAR)
-    vite_meta = state.get("__vite_config")
+    is_current = bool(vite_cfg) and json.dumps(VITE_SIDECAR) in vite_cfg.read_text()
 
-    if not vite_meta or not sidecar.exists():
-        print("⚠  Vite patches not yet applied (tool was upgraded mid-session).")
-        print(f"   Run:  vite-local-link repair")
-    elif sidecar.exists():
+    if not is_current or not sidecar.exists():
+        print("⚠  Vite patch is missing or out of date.")
+        print("   Run:  vite-local-link repair")
+    else:
         data = json.loads(sidecar.read_text())
         aliases = data.get("aliases", {})
         if aliases:
@@ -651,11 +833,13 @@ def cmd_list(args) -> None:
             print("  No companion aliases needed for current links.")
 
 
+@with_state_lock
 def cmd_repair(args) -> None:
     """
     Re-apply Vite patches to the current state without touching package.json.
     Use this when local-link was upgraded mid-session and the vite.config hasn't
-    been patched yet, or when the sidecar is missing.
+    been patched yet, has a stale patch from an older version, or the sidecar
+    is missing.
     """
     app_dir = Path.cwd()
     state = load_state()
@@ -665,23 +849,10 @@ def cmd_repair(args) -> None:
         print("No active links — nothing to repair.")
         return
 
-    vite_cfg = find_vite_config(app_dir)
+    vite_cfg = ensure_vite_patch_current(app_dir, state)
     if not vite_cfg:
         print("No vite.config found — nothing to patch.")
         return
-
-    needs_patch = "__vite_config" not in state or "__localLinkAliases" not in vite_cfg.read_text()
-
-    if needs_patch:
-        print(f"Patching {vite_cfg.name}...")
-        original = patch_vite_config(vite_cfg)
-        state["__vite_config"] = {
-            "path": str(vite_cfg),
-            "original": original,
-        }
-        print(f"  ✓ {vite_cfg.name} patched")
-    else:
-        print(f"  {vite_cfg.name} is already patched")
 
     aliases = compute_companion_aliases(active, app_dir)
     write_vite_sidecar(aliases)
@@ -690,7 +861,6 @@ def cmd_repair(args) -> None:
         print(f"  {bare}  →  {target}")
 
     clear_vite_cache(app_dir)
-    ensure_gitignored(app_dir)
     save_state(state)
     print("\n✓ Repair complete. Restart the dev server.")
 
@@ -705,11 +875,11 @@ def cmd_find(args) -> None:
         print(f"  Found : {source}")
         print(f"  Relative path from here: {rel}")
         print(f"\n  To link:")
-        print(f"    vite-local-link link -p {package} -s {rel}")
+        print(f"    vite-local-link link -p {package}={rel}")
     else:
         print(f"  Not found in sibling directories.")
-        print(f"  Pass --source manually:")
-        print(f"    vite-local-link link -p {package} -s <path/to/source>")
+        print(f"  Pass an explicit source:")
+        print(f"    vite-local-link link -p {package}=<path/to/source>")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
@@ -720,19 +890,28 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--version", action="version", version=f"vite-local-link {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_link = sub.add_parser("link", help="Link a local package source")
-    p_link.add_argument("-p", "--package", required=True, help="e.g. @RHCommerceDev/new-pdp")
-    p_link.add_argument("-s", "--source", default=None, help="Path to source (auto-detected if omitted)")
+    p_link = sub.add_parser("link", help="Link one or more local package sources")
+    p_link.add_argument(
+        "-p", "--package", required=True, nargs="+", metavar="PACKAGE[=SOURCE]",
+        help="One or more packages, e.g. my-package or my-package=../sibling/src",
+    )
+    p_link.add_argument(
+        "-s", "--source", default=None,
+        help="Path to source (only with a single --package; auto-detected if omitted)",
+    )
 
-    p_unlink = sub.add_parser("unlink", help="Restore package to published version")
-    p_unlink.add_argument("-p", "--package", required=True, help="Package to restore")
+    p_unlink = sub.add_parser("unlink", help="Restore package(s) to published version")
+    unlink_group = p_unlink.add_mutually_exclusive_group(required=True)
+    unlink_group.add_argument("-p", "--package", nargs="+", help="One or more packages to restore")
+    unlink_group.add_argument("--all", action="store_true", help="Unlink every active package")
 
     sub.add_parser("list", help="Show all active local links")
 
     p_find = sub.add_parser("find", help="Locate the source directory for a package")
-    p_find.add_argument("-p", "--package", required=True, help="e.g. @RHCommerceDev/new-pdp")
+    p_find.add_argument("-p", "--package", required=True, help="e.g. @my-scope/my-package")
 
     sub.add_parser("repair", help="Re-apply Vite patches to existing links (use after tool upgrade)")
 
@@ -740,7 +919,7 @@ def main() -> None:
 
     if not Path(PACKAGE_JSON).exists():
         print(f"Error: no {PACKAGE_JSON} found.")
-        print("Run this script from the app root (e.g. concierge-ui/).")
+        print("Run this from the consuming app root (the Vite app you're developing against).")
         sys.exit(1)
 
     dispatch = {"link": cmd_link, "unlink": cmd_unlink, "list": cmd_list, "find": cmd_find, "repair": cmd_repair}

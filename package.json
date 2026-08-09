@@ -1,13 +1,16 @@
 {
   "name": "vite-local-link",
-  "version": "1.0.4",
+  "version": "1.2.0",
   "description": "Link a local sibling package into a consuming Vite app for live dev, without publishing.",
   "bin": {
-    "vite-local-link": "index.py"
+    "vite-local-link": "bin/cli.js"
   },
   "files": [
     "index.py",
-    "README.md"
+    "bin/cli.js",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=14"
