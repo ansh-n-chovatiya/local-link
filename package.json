@@ -1,0 +1,20 @@
+{
+  "name": "vite-local-link",
+  "version": "1.0.0",
+  "description": "Link a local sibling package into a consuming Vite app for live dev, without publishing.",
+  "bin": {
+    "vite-local-link": "index.py"
+  },
+  "files": [
+    "index.py",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "license": "MIT"
+}
