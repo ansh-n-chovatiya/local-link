@@ -1,10 +1,11 @@
 {
   "name": "vite-local-link",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Link a local sibling package into a consuming Vite app for live dev, without publishing.",
   "bin": {
     "vite-local-link": "bin/cli.js"
   },
+  "preferGlobal": true,
   "files": [
     "index.py",
     "bin/cli.js",
