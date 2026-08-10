@@ -1,171 +1,274 @@
 # vite-local-link
 
-A dev tool for linking any package from a sibling repo directly into a consuming
-Vite app for live local development — without publishing, without manual config edits.
+[![Publish to npm](https://github.com/ansh-n-chovatiya/local-link/actions/workflows/publish.yml/badge.svg)](https://github.com/ansh-n-chovatiya/local-link/actions/workflows/publish.yml)
+[![npm version](https://img.shields.io/npm/v/vite-local-link.svg)](https://www.npmjs.com/package/vite-local-link)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Works on any machine and folder structure. No hardcoded repo paths.
+**Installs and runs as `vite-local-link`.**
 
----
-
-## Install
-
-Requires a Python 3 interpreter on your PATH (`python3` or `python`) — any
-version from **3.7 up** (tested through 3.14). Supported on macOS and Linux.
-
-`bin/cli.js` also tries the Windows `py` launcher and forwards through to
-`index.py`, but this hasn't been verified on an actual Windows machine yet —
-`package.json`'s `os` gate is intentionally left at `darwin`/`linux` only
-until someone confirms it. If you've tried it on Windows, open an issue.
-
-```bash
-npm install -g vite-local-link
-```
-
-Or run it ad hoc with `npx vite-local-link ...` from the consuming app root.
-
-Runs `npm install` / `yarn install` / `pnpm install` after each `link` or
-`unlink`, matching whichever lockfile (`yarn.lock`, `pnpm-lock.yaml`, or
-neither) is already in the consuming app.
-
-Check what's installed with `vite-local-link --version`.
-
-## Usage
-
-All commands run from the **consuming app root** (the Vite app you're developing against).
-
-### Link a package
-
-```bash
-vite-local-link link -p <package-name>
-```
-
-Auto-detects the source by scanning sibling directories. If it can't find it,
-give an explicit source with `name=path`:
-
-```bash
-vite-local-link link -p <package-name>=../<sibling-repo>/src/<Folder>
-```
-
-Link several packages in one shot — one `npm install`, not one per package:
-
-```bash
-vite-local-link link -p pkg-a pkg-b pkg-c=../shared-repo/src/pkg-c
-```
-
-**What `link` does automatically:**
-1. Saves the original `package.json` entries for every package linked, and
-   (on first link) the original `vite.config.ts`
-2. Rewrites matching `package.json` entries to `file:` paths
-3. Analyzes each source repo's `package.json` to find companion bare-name
-   imports that need Vite aliases (the root cause of React hook crashes with
-   local links)
-4. Writes the alias sidecar in `local-link/`
-5. Patches `vite.config.ts` to read the sidecar (only if not already patched)
-6. Runs `npm install` once, after every package is linked
-7. Clears `node_modules/.vite` so stale prebundles never survive
-
-### Unlink packages
-
-```bash
-vite-local-link unlink -p <package-name> [<package-name> ...]
-vite-local-link unlink --all
-```
-
-`--all` unlinks everything that's currently active in one command.
-
-**What `unlink` does automatically:**
-- Restores original `package.json` entries for every package unlinked
-- Recomputes Vite aliases for remaining active links
-- **If no links remain: restores `vite.config.ts` to its original state and
-  deletes the entire `local-link/` folder** — nothing to commit
-- Runs `npm install` once
-- Clears the Vite cache
-
-### List active links
-
-```bash
-vite-local-link list
-```
-
-Shows active links and which Vite aliases are currently applied.
-
-### Find a package source
-
-```bash
-vite-local-link find -p <package-name>
-```
-
----
-
-## Example
-
-```bash
-# From your consuming app root
-
-# Link multiple packages in one command — one npm install for all of them
-vite-local-link link -p my-design-system my-shared-components
-
-# Check what's active
-vite-local-link list
-
-# Restore everything at once — vite.config.ts reverts, local-link/ is removed
-vite-local-link unlink --all
-```
-
----
-
-## How the React hook crash prevention works
-
-When you link source packages, those source files import bare names
-(e.g. `"my-ui-components/Tabs"`) that in the source repo resolve via
-`tsconfig baseUrl` to local `.tsx` files. In the consuming app, the same name
-resolves to the **published compiled package** — which can re-bundle a
-UI dependency with a second copy of React, causing:
+Testing a change in a shared package against the app that consumes it normally means one of two bad options: publish a throwaway version just to test it, or `npm link` it and then spend an hour chasing the crash that follows:
 
 ```
 TypeError: Cannot read properties of null (reading 'useContext')
 Warning: Invalid hook call — more than one copy of React
 ```
 
-`vite-local-link` fixes this in two ways:
+That crash happens because `npm link` swaps in the *source* package, but the consuming app's bundler still resolves that source's own bare imports (`"my-ui-components/Tabs"`) against the **published, compiled** copy — which drags in a second copy of React alongside the one your app already has.
 
-1. **`resolve.dedupe`** — forces Vite to always use one copy of React, React DOM,
-   React Router. Added to vite.config on first link; removed on last unlink.
-
-2. **Companion aliases** — scans the source repo's `package.json` to find every
-   package it maps to local src that the consuming app has as a published `npm:`
-   alias. Writes those as `resolve.alias` entries so the source files run against
-   the same code they expect. Recomputed on every link/unlink.
+`vite-local-link` links the source in *and* fixes the resolution so nothing double-bundles: one `package.json` edit, one `vite.config` patch, computed once per link and fully reversible.
 
 ---
 
-## File layout
+## Table of contents
 
-Everything the tool writes lives inside a `local-link/` folder at your app root:
-
-| File | Purpose |
-|------|---------|
-| `local-link/state.json` | State: active links, original vite.config content, package.json originals |
-| `local-link/vite-aliases.json` | Generated Vite aliases (read by patched vite.config at startup) |
-| `local-link/.gitignore` | A single `*` — ignores everything in the folder |
-
-The folder gives itself a catch-all `.gitignore`, so none of this is ever
-git-tracked and you never need to touch your project's own `.gitignore`.
-The whole `local-link/` folder and the `vite.config.ts` patch are **fully
-removed** once you unlink the last package (or run `unlink --all`). Nothing
-gets committed.
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [CLI reference](#cli-reference)
+  - [`link`](#vite-local-link-link)
+  - [`unlink`](#vite-local-link-unlink)
+  - [`list`](#vite-local-link-list)
+  - [`find`](#vite-local-link-find)
+  - [`repair`](#vite-local-link-repair)
+- [What gets written, and where](#what-gets-written-and-where)
+- [The React-hook-crash fix, in detail](#the-react-hook-crash-fix-in-detail)
+- [Concurrency and safety](#concurrency-and-safety)
+- [Known limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
+- [License](#license)
 
 ---
 
-## Folder structure
+## How it works
 
-The tool works regardless of how your repos are laid out. It recursively
-searches every sibling directory of the consuming app root for a
-`package.json` whose `name` matches.
+Every `link`/`unlink`/`repair` does the same four things, in order:
 
-If a package still isn't found, pass `--source` with any path on your machine.
-The source path is stored as an absolute path internally and as a relative path
-in `package.json` — so it works correctly wherever your repos live.
+```
+vite-local-link link -p my-ui-components
+   │
+   ▼
+1. Resolve the source
+   │  explicit path given? use it.
+   │  otherwise: rglob every sibling directory for a package.json
+   │  whose "name" matches — no hardcoded repo layout assumed.
+   ▼
+2. Rewrite package.json
+   │  every dependencies/devDependencies/peerDependencies entry that
+   │  currently points at the package (plain version, or npm:-aliased)
+   │  is saved verbatim, then overwritten with "file:<relative path>".
+   ▼
+3. Patch vite.config
+   │  inject a small IIFE that reads local-link/vite-aliases.json,
+   │  add resolve.dedupe for react/react-dom/react-router(-dom),
+   │  spread the computed aliases into resolve.alias.
+   │  (no-ops if already patched; migrates a stale patch from an
+   │  older version.)
+   ▼
+4. Compute companion aliases
+   │  scan the source repo's own files for bare imports, cross-reference
+   │  against what the CONSUMING app has published — see below —
+   │  write the result to local-link/vite-aliases.json.
+   ▼
+npm/yarn/pnpm install (once, for every package linked in this call)
+clear node_modules/.vite
+```
+
+`unlink` runs the same machinery backwards: restore the saved `package.json` values, recompute aliases for whatever links remain, and — once nothing is left linked — revert `vite.config` to the exact bytes it had before the first link and delete the whole `local-link/` folder. There is nothing to commit or clean up by hand at any point.
+
+---
+
+## Requirements
+
+- A **Python 3** interpreter on `PATH` (`python3` or `python`), version **3.7+**. `bin/cli.js` is a thin Node shim that finds the interpreter and forwards to `index.py` — npm's own cross-platform binary shimming doesn't reliably handle a raw Python shebang on Windows.
+- macOS or Linux. The shim also tries the Windows `py` launcher, but `package.json`'s `os` field is intentionally left at `darwin`/`linux` only until someone actually confirms it working on Windows.
+- A **Vite** app as the consumer, with a `vite.config.{ts,mts,js,mjs}` at its root.
+
+---
+
+## Installation
+
+```bash
+npm install -g vite-local-link
+```
+
+Or skip the install and run it ad hoc from the consuming app root:
+
+```bash
+npx vite-local-link link -p my-ui-components
+```
+
+---
+
+## Quick start
+
+Run every command from the **consuming app's root** — the Vite app you're developing against, not the package you're editing.
+
+```bash
+# Link a package — auto-detects the source by scanning sibling directories
+vite-local-link link -p my-ui-components
+
+# Source not found next to this app? Point at it explicitly:
+vite-local-link link -p my-ui-components=../some-other-repo/packages/ui
+
+# Link several packages in one shot — one install, not one per package
+vite-local-link link -p pkg-a pkg-b pkg-c=../shared-repo/src/pkg-c
+
+# See what's currently linked
+vite-local-link list
+
+# Done testing — restore everything, package.json and vite.config included
+vite-local-link unlink --all
+```
+
+---
+
+## CLI reference
+
+### `vite-local-link link`
+
+Links one or more local packages into the app at the current directory.
+
+| Flag | Required | Description |
+|---|---|---|
+| `-p, --package <spec...>` | yes | One or more `name` or `name=path` specs |
+| `-s, --source <path>` | no | Explicit source path — only valid with a single `--package`, and only when that package's spec doesn't already carry `=path` |
+
+```bash
+vite-local-link link -p my-ui-components
+vite-local-link link -p my-ui-components=../my-ui-components-repo/src
+vite-local-link link -p pkg-a pkg-b pkg-c
+```
+
+What happens automatically, every time: the original `package.json` entries (and, on first link, the original `vite.config`) are saved to `local-link/state.json`; matching entries are rewritten to `file:` paths; the source repo's `package.json` is scanned for companion aliases; the alias sidecar is written; `vite.config` is patched if it isn't already; a single install runs after every package in the command is linked; `node_modules/.vite` is cleared.
+
+Linking a package that's already linked is a no-op with a warning — run `unlink` on it first.
+
+---
+
+### `vite-local-link unlink`
+
+Restores package(s) to their pre-link state.
+
+| Flag | Required | Description |
+|---|---|---|
+| `-p, --package <name...>` | one of these two | Package(s) to restore |
+| `--all` | one of these two | Restore every currently active link |
+
+```bash
+vite-local-link unlink -p my-ui-components
+vite-local-link unlink --all
+```
+
+Restores the exact original `package.json` values (not just "remove the `file:` entry" — a package aliased via `npm:@scope/name@1.2.3` goes back to that exact string). Recomputes aliases for whatever links remain. If this was the last active link, `vite.config` reverts to its original bytes and the entire `local-link/` folder is deleted — nothing from a linking session is left behind to accidentally commit.
+
+---
+
+### `vite-local-link list`
+
+```bash
+vite-local-link list
+```
+
+Shows every active link (package, source path, and the original `package.json` value it will restore to), plus the currently computed Vite aliases. If `vite.config`'s patch is missing or stale, prints a warning telling you to run `repair`.
+
+---
+
+### `vite-local-link find`
+
+Locates a package's source without linking it — useful to sanity-check auto-detection before committing to a link, or when a source lives somewhere the scan won't reach.
+
+```bash
+vite-local-link find -p my-ui-components
+```
+
+Prints the resolved path and the relative form, plus a ready-to-paste `link` command using it.
+
+---
+
+### `vite-local-link repair`
+
+Re-applies the `vite.config` patch and recomputes aliases for whatever is currently linked, without touching `package.json`. Doesn't add or remove any links.
+
+```bash
+vite-local-link repair
+```
+
+Use this after upgrading `vite-local-link` itself mid-session, or if `list` reports the patch as missing/stale — for example after a manual `git checkout` of `vite.config` while links were still active.
+
+---
+
+## What gets written, and where
+
+Everything this tool owns lives under `local-link/` at the app root:
+
+| Path | Purpose |
+|---|---|
+| `local-link/state.json` | Active links: source path, original `package.json` entries, original `vite.config` content |
+| `local-link/vite-aliases.json` | Computed Vite aliases, read by the patched `vite.config` at Vite startup |
+| `local-link/.lock` | Held for the duration of a `link`/`unlink`/`repair` call; see [Concurrency and safety](#concurrency-and-safety) |
+| `local-link/.gitignore` | A single `*` — created the first time the folder is, so none of this is ever git-tracked and your project's own `.gitignore` is never touched |
+
+The folder is fully removed the moment no links remain (last `unlink`, or `unlink --all`). A version prior to 1.1.0 stored this as dotfiles at the app root (`.local-links.json`, `.local-link-vite.json`) and appended their names to the project's `.gitignore` directly — if those are found, they're migrated into `local-link/` and the appended `.gitignore` lines are cleaned up automatically on the next state-writing command.
+
+`vite.config` itself gets three small, clearly-marked insertions (every inserted line carries a `// @local-link` comment so they're easy to spot in a diff, though none of this should ever end up in a real commit):
+
+1. An IIFE (or its ESM equivalent, chosen by checking the config's file extension and the nearest `package.json`'s `"type"` field) that reads `vite-aliases.json` at startup and exposes the result as `__localLinkAliases`.
+2. `resolve.dedupe: ["react", "react-dom", "react-router", "react-router-dom"]`.
+3. `...__localLinkAliases` spread as the first entry of `resolve.alias`.
+
+---
+
+## The React-hook-crash fix, in detail
+
+Linking swaps a package's `package.json` entry for `file:../source-repo/src`. Inside that source, imports like `import { Tabs } from "my-ui-components"` are bare specifiers that, in the *source repo*, resolve via its own `tsconfig` `baseUrl` to local `.tsx` files. Nothing in a plain link changes how the *consuming* app resolves that same bare name — it still resolves to whatever that name means in the consuming app's own dependency tree, which is normally the **published, compiled** package.
+
+If any dependency in that chain bundles its own copy of React, Vite's dependency optimizer now has two React copies in the module graph, and React hooks throw the moment a component from one copy renders under a provider from the other.
+
+Two independent fixes handle this:
+
+- **`resolve.dedupe`** forces Vite to resolve `react`/`react-dom`/`react-router(-dom)` to a single copy everywhere in the graph, no matter how many times they appear in `node_modules`. Cheap, and correct on its own for most cases — but not sufficient if the source repo imports a *third* package (a shared UI/utility package, say) that itself isn't deduped and carries its own React.
+- **Companion aliases** close that gap. For every active link, the source repo's files are scanned for bare imports (`from`/`import(...)` specifiers not starting with `.` or `/`). Each import is checked against the source repo's *own* `package.json`: does it map that name to its own local `src/`? If so, and the *consuming* app has that same bare name resolving to a `npm:`-aliased published package, the consuming app's `resolve.alias` is pointed at the source repo's local file instead — so both the linked package and your app import the exact same on-disk React (or whatever the shared dependency is), never two separately-bundled copies.
+
+Aliases are skipped when the consuming app already resolves that bare name to its own local `src/<name>` (an alias would hijack those imports) or when the consuming app's own entry already points at the same on-disk path as the source repo's (nothing to fix). Recomputed on every `link`, `unlink`, and `repair`, so aliases never go stale as links change.
+
+---
+
+## Concurrency and safety
+
+`link`, `unlink`, and `repair` take an exclusive lock (`local-link/.lock`, created with `O_EXCL` — atomic at the OS level, no dependency needed) before touching `state.json` or `package.json`, and release it on exit. A second invocation while one is already running fails fast with a clear error instead of interleaving writes and corrupting state.
+
+A run that ends up changing nothing (e.g. `unlink --all` with no active links, or `link` where every package failed to resolve) still creates `local-link/` for the lock file, then removes it again on exit — a no-op never leaves an empty folder behind.
+
+---
+
+## Known limitations
+
+- **Auto-detection scans sibling directories only.** `find`/`link` without `-s`/`--source` `rglob`s every sibling of the app root for a `package.json` with a matching `name` — a source repo nested more than one level away, or living outside the app's parent directory entirely, needs an explicit path.
+- **`--source` is single-package only.** Linking several packages in one call with per-package explicit paths needs the inline `name=path` form for each one, not `--source`.
+- **Import scanning is regex-based, not a real parser.** `scan_bare_imports` matches `from`/`import(...)` specifier strings via regex across `.ts`/`.tsx`/`.js`/`.jsx` files. Re-exports and dynamic import patterns outside that shape won't be picked up as companion-alias candidates.
+- **One `vite.config` patch strategy for all configs.** The patch looks for `resolve: {` and `alias: {` textually; a config that builds its `resolve`/`alias` object through a helper function instead of a literal object won't have the dedupe/alias lines inserted in a useful place, and `repair` will show as needed indefinitely. Restructure that part of the config to an inline literal, or open an issue.
+
+---
+
+## Troubleshooting
+
+**`⚠ Vite patch is missing or out of date` from `list`**
+
+Run `vite-local-link repair`. Common causes: the tool was upgraded while links were active, or `vite.config` was reverted manually (e.g. `git checkout`) without going through `unlink`.
+
+**"another vite-local-link command appears to be running"**
+
+Another `link`/`unlink`/`repair` is genuinely in flight, or a previous run crashed before releasing `local-link/.lock`. If you're sure nothing is running, delete the lock file and retry.
+
+**Hook crash still happens after linking**
+
+Run `vite-local-link list` and check the printed aliases — if the package causing the duplicate copy isn't listed, it's likely not detected as a companion import (see [Known limitations](#known-limitations)), or the consuming app doesn't have it as a `npm:`-aliased dependency in the first place. Restart the dev server after any `link`/`unlink`/`repair` — Vite's dep optimizer caches its bundle across restarts even after `node_modules/.vite` is cleared mid-session.
+
+**A linked package doesn't show the change I just made in its source**
+
+`file:` links are copied by some package managers rather than symlinked, depending on version and lockfile settings. If edits aren't showing up live, check whether your package manager symlinks `file:` dependencies by default.
 
 ---
 
@@ -175,5 +278,12 @@ in `package.json` — so it works correctly wherever your repos live.
 python3 test_index.py
 ```
 
-CI runs this on every push before publishing. See `CHANGELOG.md` for release
-history.
+CI (`.github/workflows/publish.yml`) runs this on every push to `main` before publishing, and only publishes when `package.json`'s version doesn't already match what's on npm.
+
+The suite (`test_index.py`, stdlib `unittest` only, no fixtures) covers spec parsing, `package.json` entry matching, the Vite-config patch/revert round-trip for both the corruption bugs that motivated it, ESM-vs-CJS detection, the lock, and a full `link` → `unlink --all` integration round trip.
+
+---
+
+## License
+
+MIT
