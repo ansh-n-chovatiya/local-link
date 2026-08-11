@@ -6,6 +6,8 @@ Run: python3 test_index.py
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -340,6 +342,37 @@ class LinkUnlinkAllIntegrationTests(TempDirCase):
         self.assertEqual(json.loads(Path("package.json").read_text()), self.original_pkg)
         self.assertEqual(Path("vite.config.ts").read_text(), self.original_vite_config)
         self.assertFalse(Path("local-link").exists())
+
+    @mock.patch.object(index, "run")
+    def test_unlink_all_does_not_claim_revert_when_vite_meta_missing(self, mock_run):
+        # Regression: if state.json is ever missing its "__vite_config"
+        # record (interrupted process, hand-edited state, pre-tracking
+        # version) at the final unlink, the old code silently skipped the
+        # revert, deleted local-link/ (the only place that data could have
+        # lived), and still printed "vite.config reverted to original."
+        self._build_fixture()
+
+        link_args = argparse.Namespace(package=["pkg-a", "pkg-b"], source=None)
+        index.cmd_link(link_args)
+        patched_cfg = Path("vite.config.ts").read_text()
+        self.assertIn("__localLinkAliases", patched_cfg)
+
+        # Simulate the missing record.
+        state = index.load_state()
+        del state["__vite_config"]
+        index.save_state(state)
+
+        mock_run.reset_mock()
+        unlink_args = argparse.Namespace(package=None, all=True)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            index.cmd_unlink(unlink_args)
+
+        # Nothing to safely revert with, so the patch must be left in place —
+        # not silently discarded, not claimed as reverted.
+        self.assertEqual(Path("vite.config.ts").read_text(), patched_cfg)
+        self.assertNotIn("reverted to original", out.getvalue())
+        self.assertIn("Warning", out.getvalue())
 
     @mock.patch.object(index, "run")
     def test_unlink_all_on_clean_tree_is_idempotent(self, mock_run):

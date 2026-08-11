@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.4
+
+- Fixed: `unlink --all` (or the final `unlink -p`) claimed "vite.config
+  reverted to original" even when the revert was silently skipped — because
+  `state.json`'s `__vite_config` record was missing or stale, or the config
+  file had moved — and then deleted `local-link/`, the only place the
+  pre-patch content was recorded. Now only claims success when the revert
+  actually happens, and warns instead of pretending otherwise.
+
 ## 1.2.3
 
 - Fixed: `find_pkg_entries` matched any `package.json` key equal to the

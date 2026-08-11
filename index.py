@@ -767,6 +767,7 @@ def cmd_unlink(args) -> None:
     active_links = {k: v for k, v in state.items() if not k.startswith("__")}
     is_last_unlink = len(active_links) == 0
 
+    vite_reverted = False
     if is_last_unlink:
         vite_meta = state.get("__vite_config")
         if vite_meta:
@@ -775,6 +776,17 @@ def cmd_unlink(args) -> None:
                 print(f"\nReverting {vite_path.name} to original state...")
                 revert_vite_config(vite_path, vite_meta["original"])
                 print(f"  ✓ {vite_path.name} restored")
+                vite_reverted = True
+            else:
+                print(f"\nWarning: recorded vite.config path {vite_path} no longer")
+                print("exists — skipping revert. Restore it manually if it still")
+                print("carries a local-link patch (look for '// @local-link' lines).")
+        else:
+            vite_cfg = find_vite_config(app_dir)
+            if vite_cfg and "__localLinkAliases" in vite_cfg.read_text():
+                print(f"\nWarning: {vite_cfg.name} still has a local-link patch, but")
+                print("no original content was recorded to restore it — leaving it")
+                print("as-is. Restore it manually (e.g. from git) if needed.")
         remove_local_link_dir()
         print("  Removed local-link/ — nothing left to commit.")
     else:
@@ -793,7 +805,10 @@ def cmd_unlink(args) -> None:
 
     print(f"\n✓ Unlinked {len(unlinked)} package(s): {', '.join(unlinked)}")
     if is_last_unlink:
-        print("  No more active links — vite.config reverted to original.")
+        if vite_reverted:
+            print("  No more active links — vite.config reverted to original.")
+        else:
+            print("  No more active links.")
 
 
 def cmd_list(args) -> None:
