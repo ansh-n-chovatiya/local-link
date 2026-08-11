@@ -69,6 +69,16 @@ class FindPkgEntriesTests(unittest.TestCase):
         pkg = {"dependencies": {"bar": "1.0.0"}}
         self.assertEqual(index.find_pkg_entries(pkg, "@scope/foo"), {})
 
+    def test_unrelated_short_name_key_is_not_a_hit(self):
+        # "foo" here is a distinct local package (file: link), not an alias
+        # for "@scope/foo" — same short name must not make them the same hit.
+        pkg = {"dependencies": {
+            "@scope/foo": "1.0.0",
+            "foo": "file:src/containers/Other",
+        }}
+        hits = index.find_pkg_entries(pkg, "@scope/foo")
+        self.assertEqual(hits, {"dependencies": {"@scope/foo": "1.0.0"}})
+
 
 class SrcSubpathTests(unittest.TestCase):
     def test_forms(self):

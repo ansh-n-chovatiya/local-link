@@ -219,7 +219,6 @@ def find_pkg_entries(pkg_data: dict, package_name: str) -> dict:
 
     Returns: { section: { key: original_value } }
     """
-    short = package_name.split("/")[-1]
     hits = {}
     for section in ("dependencies", "devDependencies", "peerDependencies"):
         if section not in pkg_data:
@@ -227,7 +226,6 @@ def find_pkg_entries(pkg_data: dict, package_name: str) -> dict:
         for key, value in pkg_data[section].items():
             is_hit = (
                 key == package_name
-                or key == short
                 or value.startswith(f"npm:{package_name}@")
                 or value == f"npm:{package_name}"
             )
