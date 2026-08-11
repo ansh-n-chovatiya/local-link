@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.3
+
+- Fixed: `find_pkg_entries` matched any `package.json` key equal to the
+  target package's short name, regardless of that key's value — so linking
+  a scoped package (`@scope/foo`) could clobber an unrelated bare-name
+  dependency (`foo: file:../something-else`) that just happened to share
+  the short name, overwriting its `file:` link with the scoped package's
+  source path. Now only matches the short-name key when its value is
+  genuinely an `npm:`-aliased reference to the target package.
+- Reordered the README so Requirements, Installation, and Quick start come
+  right after the intro, ahead of the rest of the docs.
+
 ## 1.2.0
 
 - `--version` flag, sourced from `package.json` (single source of truth).

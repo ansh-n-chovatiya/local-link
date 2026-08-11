@@ -19,12 +19,53 @@ That crash happens because `npm link` swaps in the *source* package, but the con
 
 ---
 
+## Requirements
+
+- A **Python 3** interpreter on `PATH` (`python3` or `python`), version **3.7+**. `bin/cli.js` is a thin Node shim that finds the interpreter and forwards to `index.py` — npm's own cross-platform binary shimming doesn't reliably handle a raw Python shebang on Windows.
+- macOS or Linux. The shim also tries the Windows `py` launcher, but `package.json`'s `os` field is intentionally left at `darwin`/`linux` only until someone actually confirms it working on Windows.
+- A **Vite** app as the consumer, with a `vite.config.{ts,mts,js,mjs}` at its root.
+
+## Installation
+
+```bash
+npm install -g vite-local-link
+```
+
+Or skip the install and run it ad hoc from the consuming app root:
+
+```bash
+npx vite-local-link link -p my-ui-components
+```
+
+## Quick start
+
+Run every command from the **consuming app's root** — the Vite app you're developing against, not the package you're editing.
+
+```bash
+# Link a package — auto-detects the source by scanning sibling directories
+vite-local-link link -p my-ui-components
+
+# Source not found next to this app? Point at it explicitly:
+vite-local-link link -p my-ui-components=../some-other-repo/packages/ui
+
+# Link several packages in one shot — one install, not one per package
+vite-local-link link -p pkg-a pkg-b pkg-c=../shared-repo/src/pkg-c
+
+# See what's currently linked
+vite-local-link list
+
+# Done testing — restore everything, package.json and vite.config included
+vite-local-link unlink --all
+```
+
+---
+
 ## Table of contents
 
-- [How it works](#how-it-works)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [How it works](#how-it-works)
 - [CLI reference](#cli-reference)
   - [`link`](#vite-local-link-link)
   - [`unlink`](#vite-local-link-unlink)
@@ -76,51 +117,6 @@ clear node_modules/.vite
 ```
 
 `unlink` runs the same machinery backwards: restore the saved `package.json` values, recompute aliases for whatever links remain, and — once nothing is left linked — revert `vite.config` to the exact bytes it had before the first link and delete the whole `local-link/` folder. There is nothing to commit or clean up by hand at any point.
-
----
-
-## Requirements
-
-- A **Python 3** interpreter on `PATH` (`python3` or `python`), version **3.7+**. `bin/cli.js` is a thin Node shim that finds the interpreter and forwards to `index.py` — npm's own cross-platform binary shimming doesn't reliably handle a raw Python shebang on Windows.
-- macOS or Linux. The shim also tries the Windows `py` launcher, but `package.json`'s `os` field is intentionally left at `darwin`/`linux` only until someone actually confirms it working on Windows.
-- A **Vite** app as the consumer, with a `vite.config.{ts,mts,js,mjs}` at its root.
-
----
-
-## Installation
-
-```bash
-npm install -g vite-local-link
-```
-
-Or skip the install and run it ad hoc from the consuming app root:
-
-```bash
-npx vite-local-link link -p my-ui-components
-```
-
----
-
-## Quick start
-
-Run every command from the **consuming app's root** — the Vite app you're developing against, not the package you're editing.
-
-```bash
-# Link a package — auto-detects the source by scanning sibling directories
-vite-local-link link -p my-ui-components
-
-# Source not found next to this app? Point at it explicitly:
-vite-local-link link -p my-ui-components=../some-other-repo/packages/ui
-
-# Link several packages in one shot — one install, not one per package
-vite-local-link link -p pkg-a pkg-b pkg-c=../shared-repo/src/pkg-c
-
-# See what's currently linked
-vite-local-link list
-
-# Done testing — restore everything, package.json and vite.config included
-vite-local-link unlink --all
-```
 
 ---
 
